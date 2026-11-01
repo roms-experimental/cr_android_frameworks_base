@@ -18,11 +18,14 @@ package android.security.gameprops;
 
 import android.app.ActivityManager;
 import android.app.IActivityManager;
+import android.content.Context;
 import android.os.Build;
 import android.os.SystemClock;
 import android.util.JsonReader;
 import android.util.JsonToken;
 import android.util.Log;
+
+import com.android.internal.util.AdvancedAppSpoofUtils;
 
 import java.io.IOException;
 import java.io.StringReader;
@@ -57,6 +60,7 @@ public final class GamePropsSpoofService {
     private volatile boolean mEnabled = false;
     private volatile boolean mDebug = false;
     private volatile Map<String, Map<String, String>> mGameConfigs = Collections.emptyMap();
+    private volatile Map<String, Map<String, String>> mHardwareConfigs = Collections.emptyMap();
     private volatile boolean mConfigLoaded = false;
 
     private final Object mLoadLock = new Object();
@@ -121,29 +125,35 @@ public final class GamePropsSpoofService {
         mLoadFailureLogged = false;
 
         if (content == null || content.trim().isEmpty()) {
-            publish(false, false, Collections.emptyMap());
+            publish(false, false, Collections.emptyMap(), Collections.emptyMap());
             Log.d(TAG, "No gameprops config in Settings.Secure");
             return;
         }
 
         try {
             Config config = parseJson(content);
-            publish(config.enabled, config.debug, config.games);
+            publish(config.enabled, config.debug, config.games, config.hardware);
             Log.i(TAG, "Game props config loaded, games=" + config.games.size()
-                    + ", enabled=" + config.enabled);
+                    + ", hardware=" + config.hardware.size() + ", enabled=" + config.enabled);
             if (config.debug) {
                 for (Map.Entry<String, Map<String, String>> e : config.games.entrySet()) {
                     Log.d(TAG, "Loaded config for " + e.getKey() + ": " + e.getValue());
                 }
+                for (Map.Entry<String, Map<String, String>> e : config.hardware.entrySet()) {
+                    Log.d(TAG, "Loaded hardware config for " + e.getKey() + ": " + e.getValue());
+                }
             }
         } catch (Throwable e) {
-            publish(false, false, Collections.emptyMap());
+            publish(false, false, Collections.emptyMap(), Collections.emptyMap());
             Log.e(TAG, "Failed to parse game props config, spoofing disabled", e);
         }
     }
 
-    private void publish(boolean enabled, boolean debug, Map<String, Map<String, String>> games) {
+    private void publish(boolean enabled, boolean debug,
+            Map<String, Map<String, String>> games,
+            Map<String, Map<String, String>> hardware) {
         mGameConfigs = games;
+        mHardwareConfigs = hardware;
         mDebug = debug;
         mEnabled = enabled;
         mConfigLoaded = true;
@@ -153,6 +163,7 @@ public final class GamePropsSpoofService {
         boolean enabled;
         boolean debug;
         final Map<String, Map<String, String>> games = new HashMap<>();
+        final Map<String, Map<String, String>> hardware = new HashMap<>();
     }
 
     private static Config parseJson(String content) throws IOException {
@@ -170,6 +181,9 @@ public final class GamePropsSpoofService {
                         break;
                     case "games":
                         parseGames(reader, config.games);
+                        break;
+                    case "hardware":
+                        parseGames(reader, config.hardware);
                         break;
                     default:
                         reader.skipValue();
@@ -274,6 +288,29 @@ public final class GamePropsSpoofService {
         } else {
             Log.w(TAG, "Spoofed " + ok + "/" + gameProps.size() + " props for " + packageName);
         }
+    }
+
+    /**
+     * Applies this package's CPU / GPU rule, if it has one. Rules are mutually exclusive with
+     * Build-field rules: a package is either in {@code games} or in {@code hardware}.
+     *
+     * @hide
+     */
+    public void spoofHardwareForPackage(Context context, String packageName) {
+        if (packageName == null) return;
+        ensureLoaded();
+        if (!mEnabled || !mConfigLoaded) return;
+
+        Map<String, String> rule = mHardwareConfigs.get(packageName);
+        if (rule == null || rule.isEmpty()) {
+            return;
+        }
+
+        if (mDebug) {
+            Log.d(TAG, "Spoofing hardware for: " + packageName);
+        }
+
+        AdvancedAppSpoofUtils.applyHardwareRule(context, rule.get("gpu"), rule.get("cpu"));
     }
 
     private boolean spoofField(String fieldName, String value, String packageName) {
@@ -492,9 +529,26 @@ public final class GamePropsSpoofService {
     /**
      * @hide
      */
+    public boolean hasHardwareConfigForPackage(String packageName) {
+        if (packageName == null) return false;
+        ensureLoaded();
+        return mHardwareConfigs.containsKey(packageName);
+    }
+
+    /**
+     * @hide
+     */
     public Map<String, Map<String, String>> getAllGameConfigs() {
         ensureLoaded();
         return new HashMap<>(mGameConfigs);
+    }
+
+    /**
+     * @hide
+     */
+    public Map<String, Map<String, String>> getAllHardwareConfigs() {
+        ensureLoaded();
+        return new HashMap<>(mHardwareConfigs);
     }
 
     /**

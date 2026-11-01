@@ -8229,6 +8229,7 @@ public final class ActivityThread extends ClientTransactionHandler
         GamePropsSpoofService gamePropsService = GamePropsSpoofService.getInstance();
         if (gamePropsService.isEnabled()) {
             gamePropsService.spoofForPackage(data.appInfo.packageName);
+            gamePropsService.spoofHardwareForPackage(appContext, data.appInfo.packageName);
         }
 
         if (PlayIntegritySpoofService.isTargetProcess(data.processName)) {
