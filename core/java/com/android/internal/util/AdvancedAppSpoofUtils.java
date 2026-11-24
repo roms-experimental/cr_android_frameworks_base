@@ -15,9 +15,12 @@ import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Per-app CPU/GPU model spoofing.
@@ -737,6 +740,7 @@ public final class AdvancedAppSpoofUtils {
                 return;
             }
         }
+        cpuFile.setReadable(true, false);
 
         Os.setenv("SPOOF_CPUINFO_PATH", cpuFile.getAbsolutePath(), true);
 
@@ -748,17 +752,123 @@ public final class AdvancedAppSpoofUtils {
         dlog("CPU spoof: hardware=" + p[CPU_HARDWARE] + " cpuinfo=" + cpuFile.getAbsolutePath());
     }
 
+    private static final Object sUnsafeLock = new Object();
+    private static boolean sUnsafeLookedUp;
+    private static Object sUnsafe;
+    private static Method sPutObject;
+    private static Field sFieldOffset;
+    private static Method sFieldGetOffset;
+
+    private static boolean initUnsafe() {
+        synchronized (sUnsafeLock) {
+            if (sUnsafeLookedUp) {
+                return sUnsafe != null && sPutObject != null
+                        && (sFieldOffset != null || sFieldGetOffset != null);
+            }
+            sUnsafeLookedUp = true;
+
+            try {
+                Class<?> unsafeClass = Class.forName("sun.misc.Unsafe");
+                Object unsafe = null;
+                for (String name : new String[] { "theUnsafe", "THE_ONE" }) {
+                    try {
+                        Field f = unsafeClass.getDeclaredField(name);
+                        f.setAccessible(true);
+                        unsafe = f.get(null);
+                        if (unsafe != null) break;
+                    } catch (Throwable ignored) {
+                    }
+                }
+                if (unsafe == null) {
+                    try {
+                        unsafe = unsafeClass.getMethod("getUnsafe").invoke(null);
+                    } catch (Throwable ignored) {
+                    }
+                }
+                if (unsafe == null) {
+                    Log.w(TAG, "sun.misc.Unsafe instance unavailable");
+                    return false;
+                }
+
+                sPutObject = unsafeClass.getMethod("putObject",
+                        Object.class, long.class, Object.class);
+                sUnsafe = unsafe;
+            } catch (Throwable t) {
+                Log.w(TAG, "Failed to resolve sun.misc.Unsafe: " + t);
+                sUnsafe = null;
+                return false;
+            }
+
+            try {
+                Field f = Field.class.getDeclaredField("offset");
+                f.setAccessible(true);
+                sFieldOffset = f;
+            } catch (Throwable ignored) {
+            }
+            if (sFieldOffset == null) {
+                try {
+                    Method m = Field.class.getDeclaredMethod("getOffset");
+                    m.setAccessible(true);
+                    sFieldGetOffset = m;
+                } catch (Throwable ignored) {
+                }
+            }
+            if (sFieldOffset == null && sFieldGetOffset == null) {
+                Log.w(TAG, "Unable to resolve java.lang.reflect.Field offset");
+                return false;
+            }
+            return true;
+        }
+    }
+
+    private static long fieldOffset(Field field) throws ReflectiveOperationException {
+        if (sFieldOffset != null) {
+            return ((Number) sFieldOffset.get(field)).longValue();
+        }
+        return ((Number) sFieldGetOffset.invoke(field)).longValue();
+    }
+
+    private static void putStaticViaUnsafe(Field field, Object value)
+            throws ReflectiveOperationException {
+        if (!initUnsafe()) {
+            throw new IllegalStateException("Unsafe fallback unavailable");
+        }
+        if (!Modifier.isStatic(field.getModifiers())) {
+            throw new IllegalArgumentException(field.getName() + " is not static");
+        }
+
+        Object base = field.getDeclaringClass();
+        long offset = fieldOffset(field);
+        sPutObject.invoke(sUnsafe, base, offset, value);
+    }
+
+    private static void setStaticField(Field field, Object value) throws Exception {
+        field.setAccessible(true);
+        try {
+            try {
+                field.set(null, value);
+            } catch (IllegalAccessException e) {
+                putStaticViaUnsafe(field, value);
+            }
+            Object now = field.get(null);
+            if (!Objects.equals(now, value)) {
+                throw new IllegalStateException("write to " + field.getName()
+                        + " did not stick (still " + now + ")");
+            }
+        } finally {
+            field.setAccessible(false);
+        }
+    }
+
     private static void setBuildField(String name, String value) {
         if (TextUtils.isEmpty(value)) return;
         try {
             final Field f = Build.class.getDeclaredField(name);
-            f.setAccessible(true);
-            f.set(null, value);
-            f.setAccessible(false);
+            setStaticField(f, value);
         } catch (NoSuchFieldException e) {
             dlog("Build." + name + " not found");
-        } catch (IllegalAccessException e) {
-            Log.w(TAG, "Cannot set Build." + name, e);
+        } catch (Throwable e) {
+            Log.w(TAG, "Cannot set Build." + name + " to " + value + ": " + e);
         }
     }
 
